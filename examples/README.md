@@ -42,6 +42,26 @@ This script resumes training from a previous checkpoint. It loads the configurat
 sbatch VLAb/examples/scripts/reproduce_smolvla_resume.slurm
 ```
 
+### Local Training (No SLURM, 512 + LoRA on VLM Vision/Text)
+
+Use this script when running directly from a shell with Accelerate:
+
+```bash
+bash VLAb/examples/scripts/reproduce_smolvla_local.sh
+```
+
+Defaults in this script:
+- `512x512` input via `--policy.resize_imgs_with_padding=[512,512]`
+- LoRA enabled on the full VLM (`--policy.peft_target_model=vlm`)
+- Vision encoder not frozen (`--policy.freeze_vision_encoder=false`)
+
+You can override defaults using environment variables, for example:
+
+```bash
+MAX_IMAGE_DIM=512 BATCH_SIZE=2 PEFT_TARGET_MODEL=vlm \
+bash VLAb/examples/scripts/reproduce_smolvla_local.sh
+```
+
 ## Dataset List Generation
 
 You can generate a dataset list from local lerobot datasets using the following script:

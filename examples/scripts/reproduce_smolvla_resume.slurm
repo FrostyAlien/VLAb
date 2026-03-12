@@ -70,6 +70,7 @@ export MAX_NUM_IMAGES=2
 export MAX_IMAGE_DIM=256
 export TRAIN_ON_ALL_FEATURES=true
 export FEATURES_VERSION=2
+export DATASET_BACKEND=hf
 
 # Advanced optimizations
 export FPS_MIN=30
@@ -149,6 +150,7 @@ echo "🎓 VLM Learning rate: $LR_VLM"
 echo "🔥 Warmup steps: $WARMUP_STEPS"
 echo "📷 Max images: $MAX_NUM_IMAGES"
 echo "🖼️  Image dimension: $MAX_IMAGE_DIM"
+echo "🗂️  Dataset backend: $DATASET_BACKEND"
 echo "👥 Data workers: $NUM_WORKERS"
 echo "🧠 VLM layers: $VLM_LAYERS"
 echo "🎯 LORA rank: $LORA_R"
@@ -165,9 +167,11 @@ accelerate launch --config_file /fsx/dana_aubakirova/vla/VLAb/accelerate_configs
     VLAb/src/lerobot/scripts/train.py \
     --resume=true \
     --config_path="$RESUME_FROM_CHECKPOINT/checkpoints/last/pretrained_model/train_config.json" \
+    --gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS \
     --policy.type=$POLICY \
     --dataset.repo_id="$REPO_IDS" \
     --dataset.root="/fsx/dana_aubakirova/vla" \
+    --dataset.backend=$DATASET_BACKEND \
     --dataset.use_imagenet_stats=$USE_IMAGENET_STATS \
     --dataset.image_transforms.enable=$ENABLE_IMG_TRANSFORM \
     --dataset.train_on_all_features=$TRAIN_ON_ALL_FEATURES \

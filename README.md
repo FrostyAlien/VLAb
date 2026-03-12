@@ -173,6 +173,33 @@ accelerate launch --config_file accelerate_configs/single_gpu.yaml ...
 accelerate launch --config_file accelerate_configs/multi_gpu.yaml ...
 ```
 
+#### Streaming from Local HF Datasets (No Conversion)
+
+If your datasets are already stored in LeRobot/HF format on local disk, you can enable native iterable streaming:
+
+```bash
+accelerate launch --config_file accelerate_configs/single_gpu.yaml \
+    src/lerobot/scripts/train.py \
+    --policy.type=smolvla2 \
+    --policy.repo_id=HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+    --dataset.backend=hf_streaming \
+    --dataset.repo_id="community_dataset_v2/user_a/ds_1,community_dataset_v2/user_b/ds_2" \
+    --dataset.root="/home/alien/.cache/huggingface/lerobot" \
+    --dataset.hf_streaming_shuffle=true \
+    --dataset.hf_streaming_shuffle_buffer_size=10000 \
+    --dataset.hf_streaming_num_shards=1 \
+    --dataset.hf_streaming_max_open_repos=8 \
+    --batch_size=8 \
+    --steps=200000 \
+    --output_dir="./outputs/training_hf_streaming"
+```
+
+Notes:
+- Shuffle is approximate (buffer-based) by design.
+- This backend avoids MDS conversion and keeps memory usage bounded by worker/buffer settings.
+- `hf_streaming_max_open_repos` limits how many repos can stay open concurrently per worker.
+- Resume uses deterministic epoch-level restart for the stream.
+
 #### Training from Local Datasets
 
 If you've pre-downloaded datasets, specify the root directory:
@@ -194,6 +221,13 @@ accelerate launch --config_file accelerate_configs/multi_gpu.yaml \
     --wandb.project="smolvla2-training"
 ```
 
+To run a local reproduction setup with `512x512` inputs and LoRA on the full VLM (vision + text),
+use:
+
+```bash
+bash examples/scripts/reproduce_smolvla_local.sh
+```
+
 **Important**: When using `--dataset.root`, the `--dataset.repo_id` paths should be relative to the root directory. For example:
 - Root: `/path/to/datasets`
 - Repo ID: `community_dataset_v1/user/dataset_name`
@@ -203,8 +237,8 @@ accelerate launch --config_file accelerate_configs/multi_gpu.yaml \
 
 For distributed training on SLURM clusters, we provide example scripts:
 
-- **`examples/scripts/train_smolvla_optimized_fresh.slurm`**: Start training from scratch
-- **`examples/scripts/train_smolvla_resume.slurm`**: Resume from checkpoint
+- **`examples/scripts/reproduce_smolvla.slurm`**: Start training from scratch
+- **`examples/scripts/reproduce_smolvla_resume.slurm`**: Resume from checkpoint
 
 **Usage:**
 
