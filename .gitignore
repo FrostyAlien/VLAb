@@ -58,7 +58,10 @@ outputs/
 *.hdf5
 data/
 datasets/
+!src/lerobot/datasets/
+!src/lerobot/datasets/*.py
 videos/
+
 
 # Cache
 .cache/
@@ -76,4 +79,3 @@ videos/
 # Large files
 *.zip
 *.tar.gz
-
