@@ -347,6 +347,7 @@ class SmolVLA2Policy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -357,12 +358,57 @@ class SmolVLA2Policy(PreTrainedPolicy):
 
         self.language_tokenizer = AutoProcessor.from_pretrained(self.config.vlm_model_name).tokenizer
         self.model = VLAFlowMatching(config)
+        self._validate_image_resize_config()
         
         # Set up image processing attributes
         self.include_past_images = self.config.n_obs_steps > 1 and "image" in self.config.past_obs_keys.split(",")
         self.num_past_images = self.config.n_obs_steps if self.include_past_images else 1
         
         self.reset()
+
+    def _validate_image_resize_config(self) -> None:
+        resize_cfg = self.config.resize_imgs_with_padding
+        if resize_cfg is None:
+            return
+
+        if not isinstance(resize_cfg, (tuple, list)) or len(resize_cfg) != 2:
+            raise ValueError(
+                "`policy.resize_imgs_with_padding` must be a (width, height) pair when set."
+            )
+
+        target_w, target_h = int(resize_cfg[0]), int(resize_cfg[1])
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError(
+                f"`policy.resize_imgs_with_padding` must be positive. Got {(target_w, target_h)}."
+            )
+
+        vision_model = self.model.vlm_with_expert.get_vision_model()
+        connector = self.model.vlm_with_expert.get_connector()
+        vision_cfg = getattr(vision_model, "config", None)
+        patch_size = getattr(vision_cfg, "patch_size", None)
+        scale_factor = getattr(connector, "scale_factor", None)
+
+        if not isinstance(patch_size, int) or patch_size <= 0:
+            return
+        if not isinstance(scale_factor, int) or scale_factor <= 0:
+            return
+
+        if target_h % patch_size != 0 or target_w % patch_size != 0:
+            raise ValueError(
+                "Incompatible image resize for SmolVLM2: "
+                f"(width={target_w}, height={target_h}) is not divisible by vision patch_size={patch_size}."
+            )
+
+        grid_h = target_h // patch_size
+        grid_w = target_w // patch_size
+        if grid_h % scale_factor != 0 or grid_w % scale_factor != 0:
+            required_multiple = patch_size * scale_factor
+            raise ValueError(
+                "Incompatible image resize for VLM connector pixel-shuffle: "
+                f"(width={target_w}, height={target_h}) -> token grid ({grid_w}, {grid_h}) "
+                f"must be divisible by connector scale_factor={scale_factor}. "
+                f"Use widths/heights that are multiples of {required_multiple} (e.g. 512x512)."
+            )
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -518,8 +564,10 @@ class SmolVLA2Policy(PreTrainedPolicy):
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
+
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
+
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
@@ -569,7 +617,9 @@ class SmolVLA2Policy(PreTrainedPolicy):
             for key in present_img_keys:
                 img = batch[key][:, i, :, :, :] if batch[key].ndim == 5 else batch[key]
                 if self.config.resize_imgs_with_padding is not None:
-                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                    target_w, target_h = self.config.resize_imgs_with_padding
+                    if img.shape[-2:] != (target_h, target_w):
+                        img = resize_with_pad(img, target_w, target_h, pad_value=0)
 
                 # Normalize from range [0,1] to [-1,1] as expacted by siglip
                 img = img * 2.0 - 1.0
@@ -754,9 +804,8 @@ class VLAFlowMatching(nn.Module):
         )
 
         self.set_requires_grad()
-        # SmolVLM2 has: [fake_tok + crop_tok + crop + fake_tok + crop_tok ... + fake_tok + global_tok + global + fake_tok] + [second image] + ...
-        self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
-        self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
+        # SmolVLM2 exposes fake/global image token ids. Other VLMs may expose a single image_token_id.
+        self.fake_image_token, self.global_image_token = self.vlm_with_expert.get_image_token_ids()
         self.global_image_start_token = torch.tensor(
             [self.fake_image_token, self.global_image_token], dtype=torch.long
         )
