@@ -14,35 +14,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-
 from torch import nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
-# from lerobot.envs.configs import EnvConfig  # Removed - not needed for SmolVLA2 pretraining
-# from lerobot.envs.utils import env_to_policy_features  # Removed - not needed for SmolVLA2 pretraining
-# SmolVLA2-only policy factory - removed all other policies
+# from lerobot.envs.configs import EnvConfig  # Removed - not needed for SmolVLA pretraining
+# from lerobot.envs.utils import env_to_policy_features  # Removed - not needed for SmolVLA pretraining
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla2.configuration_smolvla2 import SmolVLA2Config
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
     """Get the policy's class and config class given a name (matching the policy class' `name` attribute)."""
-    if name == "smolvla2":
+    if name == "smolvla":
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+        return SmolVLAPolicy
+    elif name == "smolvla2":
         from lerobot.policies.smolvla2.modeling_smolvla2 import SmolVLA2Policy
+
         return SmolVLA2Policy
     else:
-        raise NotImplementedError(f"Policy with name {name} is not implemented. Only SmolVLA2 is supported.")
+        raise NotImplementedError(
+            f"Policy with name {name} is not implemented. Supported policies: smolvla, smolvla2."
+        )
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
-    if policy_type == "smolvla2":
+    if policy_type == "smolvla":
+        return SmolVLAConfig(**kwargs)
+    elif policy_type == "smolvla2":
         return SmolVLA2Config(**kwargs)
     else:
-        raise ValueError(f"Policy type '{policy_type}' is not available. Only SmolVLA2 is supported.")
+        raise ValueError(f"Policy type '{policy_type}' is not available. Supported: smolvla, smolvla2.")
 
 
 def make_policy(
@@ -64,34 +71,36 @@ def make_policy(
         ValueError: ds_meta must be provided.
 
     Returns:
-        PreTrainedPolicy: SmolVLA2 policy instance
+        PreTrainedPolicy: SmolVLA policy instance
     """
     if not ds_meta:
-        raise ValueError("Dataset metadata must be provided for SmolVLA2 pretraining.")
+        raise ValueError("Dataset metadata must be provided for SmolVLA pretraining.")
 
-    # SmolVLA2-only factory - no backend compatibility checks needed
+    # SmolVLA policy factory (smolvla / smolvla2) - no backend compatibility checks needed.
 
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
-    # Parse features from dataset metadata (required for SmolVLA2)
+    # Parse features from dataset metadata (required for SmolVLA).
     features = dataset_to_policy_features(ds_meta.features)
-    # Handle robot-type grouped stats - flatten to feature-level stats  
+    # Handle robot-type grouped stats - flatten to feature-level stats
     if ds_meta.stats and len(ds_meta.stats) == 1:
         # Single robot type - use its stats directly
         robot_type = list(ds_meta.stats.keys())[0]
         kwargs["dataset_stats"] = ds_meta.stats[robot_type]
     elif ds_meta.stats and len(ds_meta.stats) > 1:
         # Multiple robot types - aggregate statistics across all robot types
-        # This handles multidataset scenarios where each dataset has its own robot type
         aggregated_stats = {}
         for robot_type, stats in ds_meta.stats.items():
             for feature_name, feature_stats in stats.items():
                 if feature_name not in aggregated_stats:
                     aggregated_stats[feature_name] = feature_stats
                 else:
-                    # For multidataset, we need to handle the aggregation properly
-                    pass
+                    # Use stats with larger variance to be more conservative
+                    existing = aggregated_stats[feature_name]
+                    if 'std' in feature_stats and 'std' in existing:
+                        if feature_stats['std'].mean() > existing['std'].mean():
+                            aggregated_stats[feature_name] = feature_stats
         kwargs["dataset_stats"] = aggregated_stats
     else:
         kwargs["dataset_stats"] = ds_meta.stats
