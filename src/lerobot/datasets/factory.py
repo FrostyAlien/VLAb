@@ -26,6 +26,7 @@ from lerobot.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     MultiLeRobotDataset,
 )
+from lerobot.datasets.hf_streaming_dataset import HFStreamingMultiLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 
 IMAGENET_STATS = {
@@ -69,7 +70,9 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def make_dataset(
+    cfg: TrainPipelineConfig,
+) -> LeRobotDataset | MultiLeRobotDataset | HFStreamingMultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -91,8 +94,63 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     else:
         repo_id = cfg.dataset.repo_id
     sampling_weights = cfg.dataset.sampling_weights.split(",") if cfg.dataset.sampling_weights else None
+    sampling_weights = [float(w) for w in sampling_weights] if sampling_weights else None
     feature_keys_mapping = FEATURE_KEYS_MAPPING
-    if isinstance(repo_id, str):
+    backend = getattr(cfg.dataset, "backend", "hf").lower()
+    if backend not in ["hf", "hf_streaming"]:
+        raise ValueError(
+            f"Unsupported dataset backend: {backend}. Expected one of: ['hf', 'hf_streaming']."
+        )
+
+    if backend == "hf_streaming":
+        root = getattr(cfg.dataset, "root", None)
+        repo_ids = [repo_id] if isinstance(repo_id, str) else repo_id
+        local_files_only = root is not None
+
+        delta_timestamps = {}
+        episodes = {}
+        for i in range(len(repo_ids)):
+            dataset_root = Path(root) / repo_ids[i] if root else None
+            ds_meta = LeRobotDatasetMetadata(
+                repo_ids[i],
+                root=dataset_root,
+                feature_keys_mapping=feature_keys_mapping,
+                local_files_only=local_files_only,
+            )
+            delta_timestamps[repo_ids[i]] = resolve_delta_timestamps(cfg.policy, ds_meta)
+            episodes[repo_ids[i]] = EPISODES_DATASET_MAPPING.get(repo_ids[i], cfg.dataset.episodes)
+
+        dataset = HFStreamingMultiLeRobotDataset(
+            repo_ids=repo_ids,
+            root=root,
+            split=cfg.dataset.hf_streaming_split,
+            image_transforms=image_transforms,
+            sampling_weights=sampling_weights,
+            feature_keys_mapping=feature_keys_mapping,
+            max_action_dim=cfg.policy.max_action_dim,
+            max_state_dim=cfg.policy.max_state_dim,
+            max_num_images=cfg.dataset.max_num_images,
+            max_image_dim=cfg.dataset.max_image_dim,
+            train_on_all_features=cfg.dataset.train_on_all_features,
+            min_fps=cfg.dataset.min_fps,
+            max_fps=cfg.dataset.max_fps,
+            delta_timestamps=delta_timestamps,
+            episodes=episodes,
+            video_backend=cfg.dataset.video_backend,
+            shuffle=cfg.dataset.hf_streaming_shuffle,
+            shuffle_buffer_size=cfg.dataset.hf_streaming_shuffle_buffer_size,
+            shuffle_seed=cfg.seed if cfg.seed is not None else 9176,
+            num_shards=cfg.dataset.hf_streaming_num_shards,
+            partition_by_worker=cfg.dataset.hf_streaming_partition_by_worker,
+            max_open_repos=cfg.dataset.hf_streaming_max_open_repos,
+            resume_mode=cfg.dataset.hf_streaming_resume_mode,
+            quiet_hf_datasets_logs=cfg.dataset.hf_streaming_quiet_hf_datasets_logs,
+        )
+        logging.info(
+            "Using HF streaming backend. Applied the following index mapping to the provided datasets: "
+            f"{pformat(dataset.repo_id_to_index, indent=2)}"
+        )
+    elif isinstance(repo_id, str):
         revision = getattr(cfg.dataset, "revision", None)
         root = getattr(cfg.dataset, "root", None)
         # If root is provided, construct the full path as root/repo_id
