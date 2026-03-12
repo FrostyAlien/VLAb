@@ -30,6 +30,10 @@ class DatasetConfig:
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
     # datasets are provided.
     repo_id: str
+    # Dataset loading backend.
+    # "hf" uses the current LeRobot/HF map-style path.
+    # "hf_streaming" streams directly from local HF datasets with iterable semantics.
+    backend: str = "hf"
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None
@@ -52,6 +56,18 @@ class DatasetConfig:
     motion_threshold: float = 5e-2
     motion_window_size: int = 10
     motion_buffer: int = 3
+    # HF iterable streaming backend options.
+    hf_streaming_split: str = "train"
+    hf_streaming_shuffle: bool = True
+    hf_streaming_shuffle_buffer_size: int = 10000
+    hf_streaming_num_shards: int = 1
+    hf_streaming_partition_by_worker: bool = True
+    # Cap the number of concurrently open repo iterators per worker/process.
+    # Lower values reduce RAM usage at the cost of some mixing parallelism.
+    hf_streaming_max_open_repos: int = 8
+    # Resume policy for streaming backend. "epoch" means deterministic epoch restart.
+    hf_streaming_resume_mode: str = "epoch"
+    hf_streaming_quiet_hf_datasets_logs: bool = True
 
 
 @dataclass

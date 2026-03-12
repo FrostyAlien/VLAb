@@ -16,6 +16,7 @@ import datetime as dt
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from lerobot import policies  # noqa: F401
 # from lerobot import envs  # Removed - not needed for SmolVLA2 pretraining
@@ -29,7 +30,7 @@ class EvalPipelineConfig:
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch
     # (useful for debugging). This argument is mutually exclusive with `--config`.
-    env: None = None  # Removed envs dependency for SmolVLA2 pretraining
+    env: dict[str, Any] | None = None  # Removed envs dependency for SmolVLA2 pretraining
     eval: EvalConfig = field(default_factory=EvalConfig)
     policy: PreTrainedConfig | None = None
     output_dir: Path | None = None
@@ -53,7 +54,10 @@ class EvalPipelineConfig:
             if self.env is None:
                 self.job_name = f"{self.policy.type}"
             else:
-                self.job_name = f"{self.env.type}_{self.policy.type}"
+                env_type = (
+                    self.env.get("type") if isinstance(self.env, dict) else getattr(self.env, "type", "env")
+                )
+                self.job_name = f"{env_type}_{self.policy.type}"
 
         if not self.output_dir:
             now = dt.datetime.now()

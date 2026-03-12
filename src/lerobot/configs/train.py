@@ -17,7 +17,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Type
+from typing import Any, Type
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -37,7 +37,8 @@ TRAIN_CONFIG_NAME = "train_config.json"
 @dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
-    env: None = None  # Removed envs dependency for SmolVLA2 pretraining
+    # Kept optional for backward compatibility with saved configs that contain `"env": null`.
+    env: dict[str, Any] | None = None
     policy: PreTrainedConfig | None = None
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
@@ -51,6 +52,12 @@ class TrainPipelineConfig(HubMixin):
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
+    # Number of gradient accumulation steps when launched with Accelerate.
+    # If None, do not override Accelerate's default behavior.
+    # Effective global batch size becomes: batch_size * gradient_accumulation_steps * world_size.
+    gradient_accumulation_steps: int | None = None
+    # NCCL process group timeout (seconds) when running distributed with Accelerate/DDP.
+    nccl_timeout: int = 1800
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
@@ -60,6 +67,8 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Debug: Log gradient stats by parameter group every N steps (0 to disable)
+    debug_grad_every_n_steps: int = 0
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -71,6 +80,9 @@ class TrainPipelineConfig(HubMixin):
         self.checkpoint_path = None
 
     def validate(self):
+        if self.gradient_accumulation_steps is not None and self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1 when provided.")
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -98,7 +110,10 @@ class TrainPipelineConfig(HubMixin):
             if self.env is None:
                 self.job_name = f"{self.policy.type}"
             else:
-                self.job_name = f"{self.env.type}_{self.policy.type}"
+                env_type = (
+                    self.env.get("type") if isinstance(self.env, dict) else getattr(self.env, "type", "env")
+                )
+                self.job_name = f"{env_type}_{self.policy.type}"
 
         if not self.output_dir:
             now = dt.datetime.now()
