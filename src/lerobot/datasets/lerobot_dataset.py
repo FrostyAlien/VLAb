@@ -25,6 +25,7 @@ import numpy as np
 import packaging.version
 import PIL.Image
 import torch
+import torch.nn.functional as F
 import torch.utils
 from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, snapshot_download
@@ -533,6 +534,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.motion_threshold = motion_threshold
         self.motion_window_size = motion_window_size
         self.motion_buffer = motion_buffer
+        self.max_image_dim = max_image_dim
 
         # Unused attributes
         self.image_writer = None
@@ -837,7 +839,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
+                query_timestamps[key] = [
+                    float(ts.item()) if isinstance(ts, torch.Tensor) else float(ts) for ts in timestamps
+                ]
             else:
                 query_timestamps[key] = [current_ts]
 
@@ -867,7 +871,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             
             if not is_video_key:
                 # Use the original key to query from HF dataset (parquet files use original keys)
-                queries[key] = torch.stack(self.hf_dataset.select(q_idx)[key])
+                selected = self.hf_dataset.select(q_idx)[key]
+                values = [v if isinstance(v, torch.Tensor) else torch.as_tensor(v) for v in selected]
+                queries[key] = torch.stack(values)
         return queries
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -887,6 +893,38 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _add_padding_keys(self, item: dict, padding: dict[str, list[bool]]) -> dict:
         for key, val in padding.items():
             item[key] = torch.BoolTensor(val)
+        return item
+
+    def _resize_with_pad_to_square(self, img: torch.Tensor, target_dim: int) -> torch.Tensor:
+        if img.ndim not in (3, 4):
+            return img
+
+        squeeze_batch_dim = img.ndim == 3
+        img_batched = img.unsqueeze(0) if squeeze_batch_dim else img
+        _, _, cur_h, cur_w = img_batched.shape
+        if cur_h == target_dim and cur_w == target_dim:
+            return img
+
+        ratio = max(cur_w / target_dim, cur_h / target_dim)
+        resized_h = max(1, int(round(cur_h / ratio)))
+        resized_w = max(1, int(round(cur_w / ratio)))
+        img_resized = F.interpolate(
+            img_batched, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+        )
+
+        pad_h = max(0, target_dim - resized_h)
+        pad_w = max(0, target_dim - resized_w)
+        if pad_h > 0 or pad_w > 0:
+            img_resized = F.pad(img_resized, (pad_w, 0, pad_h, 0), value=0.0)
+
+        return img_resized.squeeze(0) if squeeze_batch_dim else img_resized
+
+    def _resize_item_images(self, item: dict) -> dict:
+        if self.max_image_dim is None:
+            return item
+        for cam_key in self.meta.camera_keys:
+            if cam_key in item and isinstance(item[cam_key], torch.Tensor):
+                item[cam_key] = self._resize_with_pad_to_square(item[cam_key], self.max_image_dim)
         return item
 
     def __len__(self):
@@ -931,6 +969,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for cam in item:
                 if cam in self.meta.camera_keys or ("image" in cam and "is_pad" not in cam):
                     item[cam] = self.image_transforms(item[cam])
+        item = self._resize_item_images(item)
         # Map pad keys
         # item = map_dict_pad_keys(item, feature_keys_mapping=self.feature_keys_mapping, training_features=self.training_features)
         return item
