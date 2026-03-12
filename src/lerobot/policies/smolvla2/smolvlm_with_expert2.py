@@ -16,20 +16,26 @@ import copy
 from typing import List, Optional
 
 import torch
+from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForImageTextToText,
     AutoProcessor,
-    SmolVLMForConditionalGeneration,
 )
-from peft import LoraConfig, TaskType, get_peft_model
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
     """
     Applies RoPE positions [B, L] to x [B, L, H, D].
+
+    Args:
+        x: Input tensor of shape [B, L, H, D]
+        positions: Position indices of shape [B, L]
+        max_wavelength: Base frequency for RoPE (rope_theta).
+            - SmolVLM/LLaMA default: 10_000
+            - Gemma3 global attention: 1_000_000
     """
     d_half = x.shape[-1] // 2
     device = x.device
@@ -99,22 +105,74 @@ class SmolVLMWithExpertModel(nn.Module):
             config = self.vlm.config
         else:
             config = AutoConfig.from_pretrained(model_id)
-            self.vlm = SmolVLMForConditionalGeneration(config=config)
+            self.vlm = AutoModelForImageTextToText.from_config(config)
         self.processor = AutoProcessor.from_pretrained(model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
-            self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
-        self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
+            self.set_text_layers(self.get_text_layers()[:num_vlm_layers])
+        self.num_vlm_layers = len(self.get_text_layers())
         self.config = config
+
         # Smaller lm expert
         lm_expert_config = copy.deepcopy(config.text_config)
         hidden_size = lm_expert_config.hidden_size
-        lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)  # hidden_size // 2
-        lm_expert_config.intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
+        original_head_dim = getattr(lm_expert_config, 'head_dim', hidden_size // lm_expert_config.num_attention_heads)
+        original_num_heads = lm_expert_config.num_attention_heads
+        original_kv_heads = config.text_config.num_key_value_heads
+
+        target_hidden_size = int(hidden_size * expert_width_multiplier)
+
+        # IMPORTANT: For Gemma3 and similar models with explicit head_dim.
+        # In self_attn mode (or when self_attn_every_n_layers > 0), the expert and VLM tensors
+        # are concatenated along sequence dim, requiring SAME num_heads AND head_dim.
+        if hasattr(lm_expert_config, 'head_dim') and original_head_dim > 0:
+            if self_attn_every_n_layers > 0 or "self" in attention_mode:
+                # Must match VLM's num_attention_heads AND head_dim for tensor concatenation
+                # For Gemma3, hidden_size != num_heads * head_dim, so we must keep original values
+                if expert_width_multiplier >= 1.0:
+                    # Keep exact same config as VLM
+                    lm_expert_config.hidden_size = hidden_size
+                    lm_expert_config.head_dim = original_head_dim
+                    lm_expert_config.num_attention_heads = original_num_heads
+                    lm_expert_config.num_key_value_heads = original_kv_heads
+                else:
+                    # Scale down but maintain num_heads ratio
+                    # This will likely fail for self_attn layers - warn user
+                    new_num_heads = max(1, int(original_num_heads * expert_width_multiplier))
+                    # Ensure hidden_size is compatible (Gemma3 style: hidden_size can differ from num_heads * head_dim)
+                    lm_expert_config.hidden_size = target_hidden_size
+                    lm_expert_config.head_dim = original_head_dim
+                    lm_expert_config.num_attention_heads = new_num_heads
+
+                    kv_ratio = original_kv_heads / original_num_heads
+                    new_kv_heads = max(1, int(new_num_heads * kv_ratio))
+                    while new_num_heads % new_kv_heads != 0 and new_kv_heads > 1:
+                        new_kv_heads -= 1
+                    lm_expert_config.num_key_value_heads = new_kv_heads
+
+                    if new_num_heads != original_num_heads:
+                        print(f"[WARNING] Expert has {new_num_heads} heads vs VLM's {original_num_heads}. "
+                              f"self_attn layers will fail. Use expert_width_multiplier=1.0")
+            else:
+                # Pure cross_attn mode - can have different num_heads
+                new_num_heads = max(1, int(original_num_heads * expert_width_multiplier))
+                lm_expert_config.hidden_size = target_hidden_size
+                lm_expert_config.head_dim = original_head_dim
+                lm_expert_config.num_attention_heads = new_num_heads
+                kv_ratio = original_kv_heads / original_num_heads
+                new_kv_heads = max(1, int(new_num_heads * kv_ratio))
+                while new_num_heads % new_kv_heads != 0 and new_kv_heads > 1:
+                    new_kv_heads -= 1
+                lm_expert_config.num_key_value_heads = new_kv_heads
+        else:
+            lm_expert_config.hidden_size = target_hidden_size
+
+        lm_expert_config.intermediate_size = get_intermediate_size(lm_expert_config.hidden_size)
         lm_expert_config.num_hidden_layers = self.num_vlm_layers
+
         if num_expert_layers > 0:
-            assert len(self.get_vlm_model().text_model.layers) % num_expert_layers == 0, (
-                f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
+            assert len(self.get_text_layers()) % num_expert_layers == 0, (
+                f"Number of layers in the VLM {len(self.get_text_layers())} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
@@ -141,6 +199,9 @@ class SmolVLMWithExpertModel(nn.Module):
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
+
+        # Get RoPE theta from config (Gemma3 uses 1M for global attention, SmolVLM uses 10k)
+        self.rope_theta = getattr(config.text_config, 'rope_theta', 10_000)
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
@@ -171,38 +232,137 @@ class SmolVLMWithExpertModel(nn.Module):
             self.lora_config = lora_config
             # Apply LoRA and ensure only LoRA parameters are trainable
             if "text" in self.peft_target_model:
-                self.get_vlm_model().text_model = get_peft_model(self.get_vlm_model().text_model, lora_config)
+                self.set_text_backbone(get_peft_model(self.get_text_backbone(), lora_config))
             else:
                 self.vlm = get_peft_model(self.vlm, lora_config)
             for name, param in self.vlm.named_parameters():
-                if (
-                    "lora" in name and "text_model.model.layers.17" not in name
-                ):  # lm_head is not a parameter in most LLMs becasue it's tied to the embedding layer
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+                # Keep LoRA trainable and freeze everything else.
+                param.requires_grad = "lora" in name
 
     def merge_lora_weights(self):
         """
         Merge LoRA weights into the base model.
         """
         if "text" in self.peft_target_model:
-            self.get_vlm_model().text_model = self.get_vlm_model().text_model.merge_and_unload()
+            self.set_text_backbone(self.get_text_backbone().merge_and_unload())
         else:
             self.vlm = self.vlm.merge_and_unload()
 
     def get_vlm_model(
         self,
     ):
-        if hasattr(self.vlm.model, "model"):  # When using peft
-            return self.vlm.model.model
-        else:
-            return self.vlm.model
+        model = self.vlm
+        # Unwrap wrappers (e.g., PEFT) until we reach the multimodal core model.
+        for _ in range(5):
+            if any(hasattr(model, attr) for attr in ("vision_model", "vision_tower")) and any(
+                hasattr(model, attr) for attr in ("text_model", "language_model")
+            ):
+                return model
+            if hasattr(model, "model"):
+                model = model.model
+                continue
+            if hasattr(model, "base_model"):
+                model = model.base_model
+                continue
+            break
+        raise ValueError(
+            "Could not locate a VLM core model exposing vision/text modules. "
+            "Expected either SmolVLM-style (vision_model/text_model/connector) or "
+            "Gemma/PaliGemma-style (vision_tower/language_model/multi_modal_projector)."
+        )
+
+    def get_text_backbone(self):
+        vlm_model = self.get_vlm_model()
+        if hasattr(vlm_model, "text_model"):
+            return vlm_model.text_model
+        if hasattr(vlm_model, "language_model"):
+            return vlm_model.language_model
+        raise ValueError("VLM text backbone is missing (`text_model` or `language_model`).")
+
+    def set_text_backbone(self, model):
+        vlm_model = self.get_vlm_model()
+        if hasattr(vlm_model, "text_model"):
+            vlm_model.text_model = model
+            return
+        if hasattr(vlm_model, "language_model"):
+            vlm_model.language_model = model
+            return
+        raise ValueError("VLM text backbone is missing (`text_model` or `language_model`).")
+
+    def get_text_layers_module(self):
+        text_backbone = self.get_text_backbone()
+        if hasattr(text_backbone, "layers"):
+            return text_backbone
+        if hasattr(text_backbone, "model") and hasattr(text_backbone.model, "layers"):
+            return text_backbone.model
+        raise ValueError("Unable to locate transformer layers on text backbone.")
+
+    def get_text_layers(self):
+        return self.get_text_layers_module().layers
+
+    def set_text_layers(self, layers):
+        self.get_text_layers_module().layers = layers
+
+    def get_vision_model(self):
+        vlm_model = self.get_vlm_model()
+        if hasattr(vlm_model, "vision_model"):
+            return vlm_model.vision_model
+        if hasattr(vlm_model, "vision_tower"):
+            return vlm_model.vision_tower
+        return None
+
+    def get_connector(self):
+        vlm_model = self.get_vlm_model()
+        if hasattr(vlm_model, "connector"):
+            return vlm_model.connector
+        if hasattr(vlm_model, "multi_modal_projector"):
+            return vlm_model.multi_modal_projector
+        return None
+
+    def get_image_token_ids(self):
+        tokenizer = self.processor.tokenizer
+        fake_image_token_id = getattr(tokenizer, "fake_image_token_id", None)
+        global_image_token_id = getattr(tokenizer, "global_image_token_id", None)
+        if fake_image_token_id is not None and global_image_token_id is not None:
+            return fake_image_token_id, global_image_token_id
+
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = getattr(tokenizer, "image_token_id", None)
+
+        if image_token_id is None and hasattr(self.processor, "image_token"):
+            image_token_ids = tokenizer.encode(self.processor.image_token, add_special_tokens=False)
+            if len(image_token_ids) == 1:
+                image_token_id = image_token_ids[0]
+
+        if image_token_id is None:
+            raise ValueError(
+                "Could not infer image token ids for this processor/tokenizer. "
+                "Expected SmolVLM fake/global image tokens or a single image_token_id."
+            )
+        return image_token_id, image_token_id
+
+    def _get_text_norm_markers(self):
+        return [
+            "text_model.norm.weight",
+            "text_model.model.norm.weight",
+            "language_model.norm.weight",
+            "language_model.model.norm.weight",
+        ]
+
+    def _get_text_layer_markers(self, layer_idx: int):
+        return [
+            f"text_model.layers.{layer_idx}.",
+            f"text_model.model.layers.{layer_idx}.",
+            f"language_model.layers.{layer_idx}.",
+            f"language_model.model.layers.{layer_idx}.",
+        ]
 
     def set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.eval()
-            for params in self.get_vlm_model().vision_model.parameters():
+        vision_model = self.get_vision_model()
+        if self.freeze_vision_encoder and vision_model is not None:
+            vision_model.eval()
+            for params in vision_model.parameters():
                 params.requires_grad = False
         if self.train_expert_only:
             self.vlm.eval()
@@ -216,12 +376,9 @@ class SmolVLMWithExpertModel(nn.Module):
                 and self.num_vlm_layers % self.num_expert_layers == 0
             ):
                 last_layers.append(self.num_vlm_layers - 2)
-            frozen_layers = [
-                "lm_head",
-                "text_model.model.norm.weight",
-            ]
+            frozen_layers = ["lm_head", *self._get_text_norm_markers()]
             for layer in last_layers:
-                frozen_layers.append(f"text_model.model.layers.{layer}.")
+                frozen_layers.extend(self._get_text_layer_markers(layer))
 
             for name, params in self.vlm.named_parameters():
                 if any(k in name for k in frozen_layers):
@@ -234,29 +391,57 @@ class SmolVLMWithExpertModel(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
 
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.eval()
+        vision_model = self.get_vision_model()
+        if self.freeze_vision_encoder and vision_model is not None:
+            vision_model.eval()
 
         if self.train_expert_only:
             self.vlm.eval()
 
     def embed_image(self, image: torch.Tensor):
+        vision_model = self.get_vision_model()
+        if vision_model is None:
+            raise ValueError("VLM has no vision encoder (`vision_model`/`vision_tower`).")
+
         patch_attention_mask = None
-        # Get sequence from the vision encoder
-        image_hidden_states = (
-            self.get_vlm_model()
-            .vision_model(
-                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
+        pixel_values = image.to(dtype=vision_model.dtype)
+
+        # SmolVLM vision accepts `patch_attention_mask`, while Gemma/PaliGemma do not.
+        try:
+            vision_outputs = vision_model(
+                pixel_values=pixel_values,
                 patch_attention_mask=patch_attention_mask,
+                interpolate_pos_encoding=True,
             )
-            .last_hidden_state
-        )
-        # Modality projection & resampling
-        image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
+        except TypeError:
+            vision_outputs = vision_model(pixel_values=pixel_values, interpolate_pos_encoding=True)
+
+        image_hidden_states = vision_outputs.last_hidden_state
+
+        connector = self.get_connector()
+        if connector is None:
+            raise ValueError("VLM has no multimodal connector (`connector`/`multi_modal_projector`).")
+
+        # The Gemma3 connector hardcodes patches_per_image from the config's native
+        # image_size (e.g. 896/14=64). When using a different input resolution, the
+        # vision encoder produces a different number of patches, causing a reshape
+        # failure. Dynamically patch the connector to match the actual output.
+        if hasattr(connector, 'patches_per_image'):
+            num_patches = image_hidden_states.shape[1]
+            actual_patches_per_side = int(num_patches ** 0.5)
+            if actual_patches_per_side * actual_patches_per_side == num_patches and \
+               actual_patches_per_side != connector.patches_per_image:
+                connector.patches_per_image = actual_patches_per_side
+                # Recompute avg pool kernel to maintain the same token compression ratio
+                if hasattr(connector, 'tokens_per_side') and connector.tokens_per_side > 0:
+                    new_kernel = max(1, actual_patches_per_side // connector.tokens_per_side)
+                    connector.avg_pool = nn.AvgPool2d(kernel_size=new_kernel, stride=new_kernel)
+
+        image_hidden_states = connector(image_hidden_states)
         return image_hidden_states
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
+        return self.get_text_backbone().get_input_embeddings()(tokens)
 
     def forward_attn_layer(
         self,
@@ -308,8 +493,8 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_mask_ = _attention_mask
         position_ids_ = _position_ids
 
-        query_states = apply_rope(query_states, position_ids_)
-        key_states = apply_rope(key_states, position_ids_)
+        query_states = apply_rope(query_states, position_ids_, max_wavelength=self.rope_theta)
+        key_states = apply_rope(key_states, position_ids_, max_wavelength=self.rope_theta)
 
         if use_cache and past_key_values is None:
             past_key_values = {}
@@ -370,8 +555,8 @@ class SmolVLMWithExpertModel(nn.Module):
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
             # B,L,H,D with L sequence length, H number of heads, D head dim
-            query_states = apply_rope(query_state, position_id)
-            key_states = apply_rope(key_state, position_id)
+            query_states = apply_rope(query_state, position_id, max_wavelength=self.rope_theta)
+            key_states = apply_rope(key_state, position_id, max_wavelength=self.rope_theta)
 
             att_output = attention_interface(
                 prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
@@ -425,7 +610,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
             ]  # take into account kv
 
-            expert_query_states = apply_rope(expert_query_state, expert_position_id)
+            expert_query_states = apply_rope(expert_query_state, expert_position_id, max_wavelength=self.rope_theta)
 
             att_output = attention_interface(
                 expert_attention_mask,
@@ -465,7 +650,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
     ):
-        models = [self.get_vlm_model().text_model, self.lm_expert]
+        models = [self.get_text_layers_module(), self.lm_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
             if hidden_states is None:
