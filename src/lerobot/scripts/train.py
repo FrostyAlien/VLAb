@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -57,6 +58,11 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.wandb_utils import WandBLogger
 from lerobot.utils.trackio_utils import TrackIOLogger
+from lerobot.utils.vlm_debug_utils import (
+    init_vlm_debugger,
+    get_vlm_debugger,
+    log_gradient_stats_by_group,
+)
 
 def is_launched_with_accelerate() -> bool:
     return "ACCELERATE_MIXED_PRECISION" in os.environ
@@ -72,6 +78,8 @@ def update_policy(
     use_amp: bool = False,
     lock=None,
     accelerator=None,
+    step: int = 0,
+    debug_grad_every_n_steps: int = 0,
 ) -> tuple[MetricsTracker, dict]:
     start_time = time.perf_counter()
     device = get_device_from_parameters(policy)
@@ -117,11 +125,27 @@ def update_policy(
             accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
         else:
             policy.update()
-  
+
+    # Debug: Log gradient stats by parameter group
+    grad_stats_dict = {}
+    if debug_grad_every_n_steps > 0 and step % debug_grad_every_n_steps == 0:
+        unwrapped = accelerator.unwrap_model(policy) if accelerator else policy
+        grad_stats = log_gradient_stats_by_group(unwrapped, step)
+        # Add to output dict for wandb logging
+        for group_name, stats in grad_stats.items():
+            if stats.params_with_grad > 0:
+                grad_stats_dict[f"grad_norm/{group_name}"] = stats.grad_norm
+                grad_stats_dict[f"grad_max/{group_name}"] = stats.max_grad
+
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
+
+    # Merge grad stats into output_dict
+    if grad_stats_dict:
+        output_dict.update(grad_stats_dict)
+
     return train_metrics, output_dict
 
 
@@ -135,16 +159,32 @@ def train(cfg: TrainPipelineConfig):
         import accelerate
 
         # For example pi0 has unused params (last llm block)
-        from accelerate import DistributedDataParallelKwargs
+        from accelerate import DataLoaderConfiguration, DistributedDataParallelKwargs
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         # accelerator = accelerate.Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
         from accelerate import InitProcessGroupKwargs
         # Set NCCL timeout (default 30 minutes = 1800 seconds)
-        nccl_timeout = getattr(cfg, 'nccl_timeout', 1800)
+        nccl_timeout = cfg.nccl_timeout
         ddp_init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=nccl_timeout))
-        # Set gradient accumulation steps (default 1)
-        gradient_accumulation_steps = getattr(cfg, 'gradient_accumulation_steps', 1)
-        accelerator = accelerate.Accelerator(step_scheduler_with_optimizer=False, gradient_accumulation_steps=gradient_accumulation_steps, kwargs_handlers=[ddp_init_kwargs, ddp_kwargs])
+        dataloader_config = None
+        if getattr(cfg.dataset, "backend", "hf").lower() == "hf_streaming":
+            # Iterable streams include string fields (e.g. "task"), which are incompatible with
+            # Accelerate's dispatch+concatenate path. Disable dispatch and let each process iterate
+            # its own partition of the stream.
+            dataloader_config = DataLoaderConfiguration(
+                dispatch_batches=False,
+                split_batches=False,
+                even_batches=False,
+            )
+        accelerator_kwargs = dict(
+            step_scheduler_with_optimizer=False,
+            dataloader_config=dataloader_config,
+            kwargs_handlers=[ddp_init_kwargs, ddp_kwargs],
+        )
+        if cfg.gradient_accumulation_steps is not None:
+            accelerator_kwargs["gradient_accumulation_steps"] = cfg.gradient_accumulation_steps
+
+        accelerator = accelerate.Accelerator(**accelerator_kwargs)
         if accelerator is not None and not accelerator.is_main_process:
             # Disable duplicate logging on non-main processes
             logging.info(f"Setting logging level on non-main process {accelerator.process_index} to WARNING.")
@@ -215,8 +255,15 @@ def train(cfg: TrainPipelineConfig):
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    uses_iterable_dataset = isinstance(dataset, torch.utils.data.IterableDataset) or getattr(
+        dataset, "uses_iterable_dataset", False
+    )
+
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if uses_iterable_dataset:
+        shuffle = False
+        sampler = None
+    elif hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.episode_data_index,
@@ -226,21 +273,43 @@ def train(cfg: TrainPipelineConfig):
     else:
         shuffle = True
         sampler = None
+
+    dataloader_shuffle = shuffle
+    if getattr(dataset, "uses_internal_shuffle", False) and sampler is None:
+        dataloader_shuffle = False
+        logging.info("Dataset uses internal shuffle. Disabling DataLoader-level shuffle.")
+
+    if uses_iterable_dataset and cfg.resume and hasattr(dataset, "set_epoch"):
+        steps_per_epoch = max(1, math.ceil(max(1, dataset.num_frames) / cfg.batch_size))
+        resume_epoch = step // steps_per_epoch
+        dataset.set_epoch(resume_epoch)
+        logging.info(
+            f"Streaming backend resume mode: restarting from epoch {resume_epoch} "
+            f"(steps_per_epoch={steps_per_epoch})."
+        )
     
-    keys_to_max_dim = getattr(dataset.meta, "keys_to_max_dim", {})
-    keys_to_max_dim = {
-    "action": (32,),
-    "observation.state": (32,),
-    "observation.images.image": (3, 1080, 1920),
-    "observation.images.image2": (3, 1080, 1920),
-}
+    keys_to_max_dim = dict(getattr(dataset.meta, "keys_to_max_dim", {}) or {})
+    image_dim = cfg.dataset.max_image_dim
+    if image_dim is None:
+        resize_imgs_with_padding = getattr(cfg.policy, "resize_imgs_with_padding", None)
+        if (
+            isinstance(resize_imgs_with_padding, (tuple, list))
+            and len(resize_imgs_with_padding) == 2
+            and resize_imgs_with_padding[0] == resize_imgs_with_padding[1]
+        ):
+            image_dim = int(resize_imgs_with_padding[0])
+
+    if image_dim is not None:
+        for cam_key in getattr(dataset, "camera_keys", []):
+            keys_to_max_dim[cam_key] = int(image_dim)
+
     collate_fn = partial(multidataset_collate_fn, keys_to_max_dim=keys_to_max_dim)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         collate_fn=collate_fn,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle,
+        shuffle=dataloader_shuffle,
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=False,
@@ -285,6 +354,8 @@ def train(cfg: TrainPipelineConfig):
             lr_scheduler=lr_scheduler,
             use_amp=cfg.policy.use_amp,
             accelerator=accelerator,
+            step=step,
+            debug_grad_every_n_steps=getattr(cfg, "debug_grad_every_n_steps", 0),
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
